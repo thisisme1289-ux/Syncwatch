@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SyncWatch</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/main.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Pages rendered by JS -->
+  </div>
+
+  <!-- Templates -->
+  <template id="tpl-home">
+    <div class="page page-home">
+      <header class="home-header">
+        <div class="logo">SyncWatch</div>
+        <p class="tagline">Watch together. Use almost no data.</p>
+      </header>
+      <main class="home-main">
+        <div class="card" id="create-card">
+          <h2>Create a Room</h2>
+          <div class="field">
+            <label>Your nickname</label>
+            <input type="text" id="host-nickname" maxlength="30" placeholder="Enter nickname" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label>Mode</label>
+            <div class="mode-selector">
+              <button class="mode-btn active" data-mode="local">
+                <span class="mode-icon">L</span>
+                <span class="mode-label">Local Sync</span>
+                <span class="mode-sub">Near-zero data</span>
+              </button>
+              <button class="mode-btn" data-mode="upload">
+                <span class="mode-icon">U</span>
+                <span class="mode-label">Upload</span>
+                <span class="mode-sub">Stream from host</span>
+              </button>
+              <button class="mode-btn" data-mode="screenshare">
+                <span class="mode-icon">S</span>
+                <span class="mode-label">Screen Share</span>
+                <span class="mode-sub">High data usage</span>
+              </button>
+            </div>
+          </div>
+          <div class="field">
+            <label>Room password <span class="optional">(optional)</span></label>
+            <input type="password" id="room-password" maxlength="50" placeholder="Leave blank for open room" />
+          </div>
+          <button class="btn btn-primary" id="create-room-btn">Create Room</button>
+        </div>
+
+        <div class="divider"><span>or</span></div>
+
+        <div class="card" id="join-card">
+          <h2>Join a Room</h2>
+          <div class="field">
+            <label>Your nickname</label>
+            <input type="text" id="guest-nickname" maxlength="30" placeholder="Enter nickname" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label>Room code</label>
+            <input type="text" id="room-code-input" maxlength="6" placeholder="XXXXXX" autocomplete="off" class="mono upper" />
+          </div>
+          <div class="field" id="join-password-field" style="display:none">
+            <label>Room password</label>
+            <input type="password" id="join-password" maxlength="50" placeholder="Enter password" />
+          </div>
+          <button class="btn btn-secondary" id="join-room-btn">Join Room</button>
+        </div>
+      </main>
+    </div>
+  </template>
+
+  <template id="tpl-watch">
+    <div class="page page-watch">
+      <div class="watch-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+          <div class="sidebar-header">
+            <div class="room-info">
+              <span class="room-name" id="room-name-display"></span>
+              <span class="room-code-badge" id="room-code-badge"></span>
+            </div>
+            <div class="room-mode-badge" id="room-mode-badge"></div>
+          </div>
+
+          <div class="sidebar-section">
+            <div class="section-label">Users</div>
+            <ul class="user-list" id="user-list"></ul>
+          </div>
+
+          <div class="sidebar-section sidebar-chat" id="chat-section">
+            <div class="section-label">Chat</div>
+            <div class="chat-messages" id="chat-messages"></div>
+            <div class="chat-input-row">
+              <input type="text" id="chat-input" maxlength="300" placeholder="Message..." />
+              <button id="chat-send-btn" class="btn-icon">Send</button>
+            </div>
+          </div>
+
+          <div class="sidebar-actions">
+            <button class="btn btn-sm" id="copy-link-btn">Copy invite link</button>
+            <button class="btn btn-sm btn-danger" id="leave-room-btn">Leave</button>
+          </div>
+        </aside>
+
+        <!-- Video area -->
+        <main class="watch-main">
+          <div class="video-container" id="video-container">
+            <!-- Local mode -->
+            <div class="mode-panel" id="local-panel">
+              <div class="local-prompt" id="local-prompt">
+                <p>Load your local video file to begin.</p>
+                <input type="file" id="local-file-input" accept="video/*" style="display:none" />
+                <button class="btn btn-primary" id="local-load-btn">Load Video File</button>
+              </div>
+              <video id="local-video" style="display:none" preload="none"></video>
+            </div>
+
+            <!-- Upload mode -->
+            <div class="mode-panel" id="upload-panel" style="display:none">
+              <div class="upload-prompt" id="upload-host-prompt" style="display:none">
+                <p>Upload a video for everyone to watch.</p>
+                <input type="file" id="upload-file-input" accept="video/*" style="display:none" />
+                <button class="btn btn-primary" id="upload-file-btn">Select Video</button>
+                <div class="upload-progress" id="upload-progress" style="display:none">
+                  <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+                  <span id="progress-text">Uploading...</span>
+                </div>
+              </div>
+              <div class="upload-waiting" id="upload-guest-prompt" style="display:none">
+                <p>Waiting for host to upload video...</p>
+              </div>
+              <video id="upload-video" style="display:none" preload="metadata"></video>
+            </div>
+
+            <!-- Screenshare mode -->
+            <div class="mode-panel" id="screenshare-panel" style="display:none">
+              <div class="ss-host-prompt" id="ss-host-prompt" style="display:none">
+                <p>Share your screen with everyone in the room.</p>
+                <p class="note">Screen sharing uses significantly more data than other modes.</p>
+                <button class="btn btn-primary" id="ss-start-btn">Start Screen Share</button>
+              </div>
+              <div class="ss-guest-prompt" id="ss-guest-prompt" style="display:none">
+                <p>Waiting for host to start screen share...</p>
+              </div>
+              <video id="ss-video" autoplay playsinline style="display:none"></video>
+            </div>
+          </div>
+
+          <!-- Playback controls -->
+          <div class="playback-bar" id="playback-bar">
+            <div class="progress-track" id="progress-track">
+              <div class="progress-played" id="progress-played"></div>
+            </div>
+            <div class="controls-row">
+              <div class="controls-left">
+                <button class="btn-icon" id="play-pause-btn" title="Play / Pause">Play</button>
+                <span class="time-display" id="time-display">0:00 / 0:00</span>
+              </div>
+              <div class="controls-right">
+                <select id="quality-select" class="ctrl-select" title="Quality">
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="source">Source</option>
+                </select>
+                <select id="speed-select" class="ctrl-select" title="Speed">
+                  <option value="0.5">0.5x</option>
+                  <option value="1" selected>1x</option>
+                  <option value="1.25">1.25x</option>
+                  <option value="1.5">1.5x</option>
+                  <option value="2">2x</option>
+                </select>
+                <button class="btn-icon" id="fullscreen-btn" title="Fullscreen">Expand</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Host settings panel -->
+          <div class="host-panel" id="host-panel" style="display:none">
+            <div class="host-panel-title">Room Settings</div>
+            <label class="toggle-row">
+              <span>Host-only playback control</span>
+              <input type="checkbox" id="setting-host-only" />
+            </label>
+            <label class="toggle-row">
+              <span>Chat enabled</span>
+              <input type="checkbox" id="setting-chat" />
+            </label>
+            <label class="toggle-row">
+              <span>Voice chat</span>
+              <input type="checkbox" id="setting-voice" />
+            </label>
+            <label class="toggle-row">
+              <span>Data saver mode</span>
+              <input type="checkbox" id="setting-datasaver" />
+            </label>
+          </div>
+
+          <!-- Data meter -->
+          <div class="data-meter" id="data-meter">
+            <span class="data-label">Data used:</span>
+            <span class="data-value" id="data-value">0 KB</span>
+            <button class="btn-tiny" id="settings-toggle-btn">Settings</button>
+          </div>
+        </main>
+      </div>
+    </div>
+  </template>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/js/utils.js"></script>
+  <script src="/js/room.js"></script>
+  <script src="/js/player.js"></script>
+  <script src="/js/screenshare.js"></script>
+  <script src="/js/datacounter.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
