@@ -436,6 +436,9 @@
       return;
     }
 
+    /* show the prompt panel — it starts as display:none in HTML */
+    showEl('ss-host-prompt');
+
     startBtn.addEventListener('click', function () {
       startScreenShare();
     });
