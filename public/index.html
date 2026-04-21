@@ -88,6 +88,13 @@
   <template id="tpl-watch">
     <div class="page page-watch">
       <div class="watch-layout">
+
+        <!-- ↓ NEW: mobile sidebar toggle button -->
+        <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle sidebar" aria-expanded="false">&#9776;</button>
+
+        <!-- ↓ NEW: tap-outside overlay to close sidebar on mobile -->
+        <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
         <!-- Sidebar -->
         <aside class="sidebar" id="sidebar">
           <div class="sidebar-header">
@@ -232,5 +239,39 @@
   <script src="/js/player.js"></script>
   <script src="/js/screenshare.js"></script>
   <script src="/js/app.js"></script>
+
+  <!-- Mobile sidebar toggle — runs after DOM is ready -->
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      var toggleBtn = document.getElementById('sidebar-toggle');
+      var overlay   = document.getElementById('sidebar-overlay');
+      var sidebar   = document.getElementById('sidebar');
+      if (!toggleBtn || !overlay || !sidebar) return;
+
+      function openSidebar() {
+        sidebar.classList.add('open');
+        overlay.classList.add('active');
+        toggleBtn.setAttribute('aria-expanded', 'true');
+      }
+      function closeSidebar() {
+        sidebar.classList.remove('open');
+        overlay.classList.remove('active');
+        toggleBtn.setAttribute('aria-expanded', 'false');
+      }
+
+      toggleBtn.addEventListener('click', function () {
+        sidebar.classList.contains('open') ? closeSidebar() : openSidebar();
+      });
+      overlay.addEventListener('click', closeSidebar);
+
+      // Close sidebar after sending a chat message on mobile
+      var chatSend = document.getElementById('chat-send-btn');
+      if (chatSend) {
+        chatSend.addEventListener('click', function () {
+          if (window.innerWidth <= 640) closeSidebar();
+        });
+      }
+    });
+  </script>
 </body>
 </html>
