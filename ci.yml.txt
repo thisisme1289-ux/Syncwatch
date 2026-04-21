@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Syntax check server files
+        run: |
+          node --check server/index.js
+          node --check server/rooms.js
+          node --check server/socket.js
+          node --check server/upload.js
+
+      - name: Syntax check client files
+        run: |
+          node --check public/js/utils.js
+          node --check public/js/datacounter.js
+          node --check public/js/room.js
+          node --check public/js/player.js
+          node --check public/js/screenshare.js
+          node --check public/js/app.js
