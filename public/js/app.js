@@ -11,32 +11,30 @@
 document.addEventListener('DOMContentLoaded', function () {
   'use strict';
 
-  /* ── in-memory state (never localStorage) ───────────────────────────────── */
+  /* ── in-memory state (no localStorage, no sessionStorage) ──────────────── */
   var state = {
-    socket:      null,
-    roomId:      null,
-    roomCode:    null,
-    roomMode:    null,
-    isHost:      false,
-    hostToken:   null,
-    nickname:    null,
-    mySocketId:  null,
-    settings:    {},
+    socket:     null,
+    roomId:     null,
+    roomCode:   null,
+    roomMode:   null,
+    isHost:     false,
+    hostToken:  null,
+    nickname:   null,
+    mySocketId: null,
+    settings:   {},
   };
 
-  /* ── escape helper (guards chat / nicknames against XSS) ───────────────── */
+  /* ── helpers ────────────────────────────────────────────────────────────── */
   function escHtml(str) {
     return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+      .replace(/&/g,  '&amp;')
+      .replace(/</g,  '&lt;')
+      .replace(/>/g,  '&gt;')
+      .replace(/"/g,  '&quot;');
   }
 
-  /* ── safe DOM getter ────────────────────────────────────────────────────── */
   function el(id) { return document.getElementById(id); }
 
-  /* ── toast wrapper (utils.js provides showToast) ───────────────────────── */
   function toast(msg) {
     if (typeof showToast === 'function') showToast(msg);
     else console.warn('[app]', msg);
@@ -62,7 +60,7 @@ document.addEventListener('DOMContentLoaded', function () {
   function initHomePage() {
     showPage('tpl-home');
 
-    /* ── mode selector ───────────────────────────────────────────────────── */
+    /* mode selector */
     var selectedMode = 'local';
     el('app').querySelectorAll('.mode-btn').forEach(function (btn) {
       btn.addEventListener('click', function () {
@@ -74,12 +72,15 @@ document.addEventListener('DOMContentLoaded', function () {
       });
     });
 
-    /* ── check URL for pre-filled room code ─────────────────────────────── */
-    var params = new URLSearchParams(window.location.search);
-    var codeParam = params.get('code') || params.get('room') || '';
+    /* pre-fill code from URL */
+    var params    = new URLSearchParams(window.location.search);
+    var codeParam = (params.get('code') || params.get('room') || '').toUpperCase();
     if (codeParam) {
       var codeInput = el('room-code-input');
-      if (codeInput) codeInput.value = codeParam.toUpperCase();
+      if (codeInput) {
+        codeInput.value = codeParam;
+        lookupRoom(codeParam);
+      }
     }
 
     /* ── create room ─────────────────────────────────────────────────────── */
@@ -87,14 +88,14 @@ document.addEventListener('DOMContentLoaded', function () {
     if (createBtn) {
       createBtn.addEventListener('click', function () {
         var nickname = (el('host-nickname').value || '').trim();
-        var password = (el('room-password').value || '').trim();
+        var password = (el('room-password').value  || '').trim();
         if (!nickname) { toast('Please enter a nickname.'); return; }
 
-        createBtn.disabled = true;
+        createBtn.disabled    = true;
         createBtn.textContent = 'Creating...';
 
         fetch('/api/rooms', {
-          method: 'POST',
+          method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             nickname: nickname,
@@ -114,47 +115,72 @@ document.addEventListener('DOMContentLoaded', function () {
           return r.json();
         })
         .then(function (data) {
-          /* store host credentials in memory */
           state.hostToken = data.hostToken;
           state.nickname  = nickname;
-          /* connect and join */
+          /* host already has UUID from the create response — pass it directly */
           connectAndJoin(data.roomId, nickname, password, data.hostToken);
         })
         .catch(function (err) {
           toast('Could not create room: ' + err.message);
-          createBtn.disabled = false;
+          createBtn.disabled    = false;
           createBtn.textContent = 'Create Room';
         });
       });
     }
 
     /* ── join room ───────────────────────────────────────────────────────── */
-    var joinBtn = el('join-room-btn');
-    if (joinBtn) {
-      /* look up room when code is entered (to show password field if needed) */
-      var codeInput2 = el('room-code-input');
-      if (codeInput2) {
-        codeInput2.addEventListener('input', function () {
-          var code = codeInput2.value.trim().toUpperCase();
-          if (code.length === 6) lookupRoom(code);
-        });
-        /* also trigger if pre-filled from URL */
-        if (codeInput2.value.length === 6) lookupRoom(codeInput2.value.trim().toUpperCase());
-      }
+    var joinBtn   = el('join-room-btn');
+    var codeInput = el('room-code-input');
 
+    if (codeInput) {
+      codeInput.addEventListener('input', function () {
+        var code = codeInput.value.trim().toUpperCase();
+        codeInput.value = code;
+        if (code.length === 6) lookupRoom(code);
+      });
+    }
+
+    if (joinBtn) {
       joinBtn.addEventListener('click', function () {
-        var nickname = (el('guest-nickname').value || '').trim();
-        var code     = ((el('room-code-input') || {}).value || '').trim().toUpperCase();
+        var nickname = (el('guest-nickname').value  || '').trim();
+        var code     = (codeInput ? codeInput.value : '').trim().toUpperCase();
         var password = ((el('join-password') || {}).value || '').trim();
+
         if (!nickname) { toast('Please enter a nickname.'); return; }
         if (!code || code.length !== 6) { toast('Please enter a 6-character room code.'); return; }
 
-        state.nickname = nickname;
-        connectAndJoin(code, nickname, password, null);
+        joinBtn.disabled    = true;
+        joinBtn.textContent = 'Joining...';
+        state.nickname      = nickname;
+
+        /*
+          BUG FIX #1 — 404 / "Room not found" when joining by code:
+
+          server/socket.js join_room handler calls roomManager.get(roomId)
+          which is a UUID-only Map lookup. Passing the 6-char code as roomId
+          always returns null -> "Room not found".
+
+          Fix: resolve the 6-char code to a UUID via HTTP first, then use
+          the real UUID when emitting join_room over the socket.
+        */
+        fetch('/api/rooms/' + code)
+          .then(function (r) {
+            if (!r.ok) throw new Error('Room not found. Check the code and try again.');
+            return r.json();
+          })
+          .then(function (roomData) {
+            connectAndJoin(roomData.roomId, nickname, password, null);
+          })
+          .catch(function (err) {
+            toast(err.message);
+            joinBtn.disabled    = false;
+            joinBtn.textContent = 'Join Room';
+          });
       });
     }
   }
 
+  /* Fetch room info to reveal password field when needed */
   function lookupRoom(code) {
     fetch('/api/rooms/' + code)
       .then(function (r) { return r.json(); })
@@ -164,30 +190,29 @@ document.addEventListener('DOMContentLoaded', function () {
           if (pf) pf.style.display = 'block';
         }
       })
-      .catch(function () {});
+      .catch(function () { /* room not found yet — silently ignore */ });
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
-     SOCKET — connect and join room
+     SOCKET — connect and join (roomId is always a UUID by this point)
      ══════════════════════════════════════════════════════════════════════════ */
 
-  function connectAndJoin(roomIdentifier, nickname, password, hostToken) {
-    /* disconnect any existing socket first */
+  function connectAndJoin(roomId, nickname, password, hostToken) {
     if (state.socket) {
       state.socket.disconnect();
       state.socket = null;
     }
 
     var socket = io({
-      transports: ['websocket'],
+      transports:           ['websocket'],
       reconnectionAttempts: 5,
-      reconnectionDelay: 1000,
+      reconnectionDelay:    1000,
     });
     state.socket = socket;
 
     socket.on('connect', function () {
       socket.emit('join_room', {
-        roomId:    roomIdentifier,
+        roomId:    roomId,
         nickname:  nickname,
         password:  password  || undefined,
         hostToken: hostToken || undefined,
@@ -198,7 +223,6 @@ document.addEventListener('DOMContentLoaded', function () {
       toast((data && data.message) ? data.message : 'Failed to join room.');
       socket.disconnect();
       state.socket = null;
-      /* re-enable buttons if we came from home page */
       var createBtn = el('create-room-btn');
       var joinBtn   = el('join-room-btn');
       if (createBtn) { createBtn.disabled = false; createBtn.textContent = 'Create Room'; }
@@ -206,7 +230,6 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 
     socket.on('room_joined', function (data) {
-      /* persist session state */
       state.roomId     = data.roomId;
       state.roomCode   = data.code;
       state.roomMode   = data.mode;
@@ -214,10 +237,7 @@ document.addEventListener('DOMContentLoaded', function () {
       state.mySocketId = data.mySocketId;
       state.settings   = data.settings || {};
 
-      /* update URL so user can share the link */
       history.replaceState({}, '', '/?code=' + data.code);
-
-      /* render watch page */
       initWatchPage(data, socket);
     });
 
@@ -240,7 +260,6 @@ document.addEventListener('DOMContentLoaded', function () {
   function initWatchPage(roomData, socket) {
     showPage('tpl-watch');
 
-    /* ── sidebar info ────────────────────────────────────────────────────── */
     var nameEl = el('room-name-display');
     if (nameEl) nameEl.textContent = roomData.hostNickname || 'Room';
 
@@ -249,7 +268,7 @@ document.addEventListener('DOMContentLoaded', function () {
       codeEl.textContent = roomData.code;
       codeEl.title = 'Click to copy room code';
       codeEl.addEventListener('click', function () {
-        copyText(roomData.code);
+        if (typeof copyText === 'function') copyText(roomData.code);
         toast('Room code copied.');
       });
     }
@@ -257,39 +276,33 @@ document.addEventListener('DOMContentLoaded', function () {
     var modeEl = el('room-mode-badge');
     if (modeEl) modeEl.textContent = roomData.mode;
 
-    /* ── initial user list ───────────────────────────────────────────────── */
     if (roomData.users) {
-      roomData.users.forEach(function (u) { addUserToList(u.socketId, u.nickname, u.isHost); });
+      roomData.users.forEach(function (u) {
+        addUserToList(u.socketId, u.nickname, u.isHost);
+      });
     }
 
-    /* ── initial chat history ────────────────────────────────────────────── */
     if (roomData.chat) {
-      roomData.chat.forEach(function (msg) { appendChatMessage(msg.nickname, msg.text, msg.ts); });
+      roomData.chat.forEach(function (msg) {
+        appendChatMessage(msg.nickname, msg.text, msg.ts);
+      });
     }
 
-    /* ── mode panels ─────────────────────────────────────────────────────── */
     var mode = roomData.mode;
-    el('local-panel')       && (el('local-panel').style.display       = mode === 'local'       ? 'flex' : 'none');
-    el('upload-panel')      && (el('upload-panel').style.display      = mode === 'upload'      ? 'flex' : 'none');
-    el('screenshare-panel') && (el('screenshare-panel').style.display = mode === 'screenshare' ? 'flex' : 'none');
+    if (el('local-panel'))       el('local-panel').style.display       = mode === 'local'       ? 'flex' : 'none';
+    if (el('upload-panel'))      el('upload-panel').style.display      = mode === 'upload'      ? 'flex' : 'none';
+    if (el('screenshare-panel')) el('screenshare-panel').style.display = mode === 'screenshare' ? 'flex' : 'none';
 
-    /* ── host settings panel ─────────────────────────────────────────────── */
     var hostPanel = el('host-panel');
     if (hostPanel) hostPanel.style.display = state.isHost ? 'block' : 'none';
 
-    /* ── apply initial settings ──────────────────────────────────────────── */
     applySettings(state.settings);
-
-    /* ── sidebar toggle (mobile) ─────────────────────────────────────────── */
     initSidebarToggle();
-
-    /* ── wire all UI ─────────────────────────────────────────────────────── */
     wireChat(socket);
     wireSidebarActions(socket);
     wireHostSettings(socket);
     wireDataMeter();
 
-    /* ── init mode-specific behaviour ────────────────────────────────────── */
     if (mode === 'local') {
       initLocalMode(socket, roomData);
     } else if (mode === 'upload') {
@@ -298,7 +311,6 @@ document.addEventListener('DOMContentLoaded', function () {
       initScreenshareMode(socket, roomData);
     }
 
-    /* ── register all server->client socket events ───────────────────────── */
     registerSocketListeners(socket);
   }
 
@@ -308,7 +320,6 @@ document.addEventListener('DOMContentLoaded', function () {
 
   function registerSocketListeners(socket) {
 
-    /* ── user presence ───────────────────────────────────────────────────── */
     socket.on('user_joined', function (data) {
       addUserToList(data.socketId, data.nickname, data.isHost);
       appendSystemMessage(escHtml(data.nickname) + ' joined.');
@@ -320,96 +331,81 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 
     socket.on('host_transferred', function (data) {
-      /* update isHost flag if this client is the new host */
       if (data.newHostId === state.mySocketId) {
         state.isHost = true;
         var hostPanel = el('host-panel');
         if (hostPanel) hostPanel.style.display = 'block';
         toast('You are now the host.');
       }
-      /* refresh host badge in user list */
       updateHostBadge(data.newHostId);
-      appendSystemMessage(escHtml(data.newHostNickname) + ' is now the host.');
+      appendSystemMessage(escHtml(data.newHostNickname || '') + ' is now the host.');
     });
 
-    /* ── playback events ─────────────────────────────────────────────────── */
     socket.on('playback_play', function (data) {
-      if (typeof Player !== 'undefined' && Player.receivePlay) {
-        Player.receivePlay(data.timestamp);
-      }
-      appendSystemMessage(escHtml(data.by || '') + ' pressed play.');
+      if (typeof Player !== 'undefined' && Player.receivePlay) Player.receivePlay(data.timestamp);
     });
 
     socket.on('playback_pause', function (data) {
-      if (typeof Player !== 'undefined' && Player.receivePause) {
-        Player.receivePause(data.timestamp);
-      }
-      appendSystemMessage(escHtml(data.by || '') + ' paused.');
+      if (typeof Player !== 'undefined' && Player.receivePause) Player.receivePause(data.timestamp);
     });
 
     socket.on('playback_seek', function (data) {
-      if (typeof Player !== 'undefined' && Player.receiveSeek) {
-        Player.receiveSeek(data.timestamp);
-      }
+      if (typeof Player !== 'undefined' && Player.receiveSeek) Player.receiveSeek(data.timestamp);
     });
 
     socket.on('playback_rate', function (data) {
-      if (typeof Player !== 'undefined' && Player.receiveRate) {
-        Player.receiveRate(data.rate);
-      }
+      if (typeof Player !== 'undefined' && Player.receiveRate) Player.receiveRate(data.rate);
       var sel = el('speed-select');
       if (sel) sel.value = String(data.rate);
     });
 
     socket.on('sync_state', function (data) {
-      if (typeof Player !== 'undefined' && Player.receiveSync) {
-        Player.receiveSync(data.playback);
-      }
+      if (typeof Player !== 'undefined' && Player.receiveSync) Player.receiveSync(data.playback);
     });
 
-    /* ── chat ────────────────────────────────────────────────────────────── */
     socket.on('chat_message', function (msg) {
       appendChatMessage(msg.nickname, msg.text, msg.ts);
     });
 
-    /* ── settings ────────────────────────────────────────────────────────── */
     socket.on('settings_update', function (data) {
       state.settings = data.settings || state.settings;
       applySettings(state.settings);
     });
 
-    /* ── upload mode: media ready ────────────────────────────────────────── */
     socket.on('media_ready', function (data) {
       if (state.roomMode !== 'upload' || state.isHost) return;
       var guestPrompt = el('upload-guest-prompt');
       var video       = el('upload-video');
       if (guestPrompt) guestPrompt.style.display = 'none';
       if (video && data.url) {
-        video.src = data.url;
+        video.src           = data.url;
         video.style.display = 'block';
-        if (typeof Player !== 'undefined' && Player.attachUploadVideo) {
-          Player.attachUploadVideo(video, socket, state.roomId);
+        if (typeof Player !== 'undefined' && Player.init) {
+          Player.init({
+            videoEl:  video,
+            socket:   socket,
+            roomId:   state.roomId,
+            isHost:   state.isHost,
+            playback: {},
+            settings: state.settings,
+          });
         }
-        /* request current playback state so late joiner syncs up */
+        wirePlaybackBar(socket);
         socket.emit('request_sync', { roomId: state.roomId });
       }
       toast('Host started the video.');
     });
-
-    /* quality_change is per-viewer only; no global handler needed */
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
      MODE INITIALIZATION
      ══════════════════════════════════════════════════════════════════════════ */
 
-  /* ── Local Sync mode ─────────────────────────────────────────────────────── */
   function initLocalMode(socket, roomData) {
     var loadBtn   = el('local-load-btn');
     var fileInput = el('local-file-input');
     var video     = el('local-video');
     var prompt    = el('local-prompt');
-
     if (!loadBtn || !fileInput || !video) return;
 
     loadBtn.addEventListener('click', function () { fileInput.click(); });
@@ -417,9 +413,7 @@ document.addEventListener('DOMContentLoaded', function () {
     fileInput.addEventListener('change', function () {
       var file = fileInput.files[0];
       if (!file) return;
-
-      var url = URL.createObjectURL(file);
-      video.src = url;
+      video.src           = URL.createObjectURL(file);
       video.style.display = 'block';
       if (prompt) prompt.style.display = 'none';
 
@@ -433,16 +427,11 @@ document.addEventListener('DOMContentLoaded', function () {
           settings: state.settings,
         });
       }
-
-      /* sync with room on load */
       socket.emit('request_sync', { roomId: state.roomId });
+      wirePlaybackBar(socket);
     });
-
-    /* wire playback bar */
-    wirePlaybackBar(socket);
   }
 
-  /* ── Upload mode ─────────────────────────────────────────────────────────── */
   function initUploadMode(socket, roomData) {
     var video = el('upload-video');
 
@@ -455,16 +444,15 @@ document.addEventListener('DOMContentLoaded', function () {
       var progressTxt = el('progress-text');
 
       if (hostPrompt) hostPrompt.style.display = 'flex';
-      if (uploadBtn)  uploadBtn.addEventListener('click', function () { fileInput && fileInput.click(); });
+      if (uploadBtn) uploadBtn.addEventListener('click', function () { if (fileInput) fileInput.click(); });
 
       if (fileInput) {
         fileInput.addEventListener('change', function () {
           var file = fileInput.files[0];
           if (!file) return;
 
-          var MAX_MB = 2048;
-          if (file.size > MAX_MB * 1024 * 1024) {
-            toast('File is too large. Max is ' + MAX_MB + ' MB.');
+          if (file.size > 2048 * 1024 * 1024) {
+            toast('File is too large. Max is 2048 MB.');
             return;
           }
 
@@ -472,8 +460,8 @@ document.addEventListener('DOMContentLoaded', function () {
           if (uploadBtn)   uploadBtn.disabled = true;
 
           var formData = new FormData();
-          formData.append('video', file);
-          formData.append('roomId', state.roomId);
+          formData.append('video',     file);
+          formData.append('roomId',    state.roomId);
           formData.append('hostToken', state.hostToken);
 
           var xhr = new XMLHttpRequest();
@@ -483,7 +471,7 @@ document.addEventListener('DOMContentLoaded', function () {
             if (e.lengthComputable) {
               var pct = Math.round((e.loaded / e.total) * 100);
               if (progressBar) progressBar.style.width = pct + '%';
-              if (progressTxt) progressTxt.textContent = pct + '%';
+              if (progressTxt) progressTxt.textContent  = pct + '%';
             }
           };
 
@@ -492,7 +480,7 @@ document.addEventListener('DOMContentLoaded', function () {
               var resp = JSON.parse(xhr.responseText);
               if (hostPrompt) hostPrompt.style.display = 'none';
               if (video) {
-                video.src = resp.url;
+                video.src           = resp.url;
                 video.style.display = 'block';
                 if (typeof Player !== 'undefined' && Player.init) {
                   Player.init({
@@ -504,18 +492,18 @@ document.addEventListener('DOMContentLoaded', function () {
                     settings: state.settings,
                   });
                 }
+                wirePlaybackBar(socket);
               }
-              wirePlaybackBar(socket);
             } else {
-              toast('Upload failed.');
-              if (uploadBtn) uploadBtn.disabled = false;
+              toast('Upload failed. Try again.');
+              if (uploadBtn)   uploadBtn.disabled = false;
               if (progressBox) progressBox.style.display = 'none';
             }
           };
 
           xhr.onerror = function () {
             toast('Upload error. Check your connection.');
-            if (uploadBtn) uploadBtn.disabled = false;
+            if (uploadBtn)   uploadBtn.disabled = false;
             if (progressBox) progressBox.style.display = 'none';
           };
 
@@ -524,49 +512,42 @@ document.addEventListener('DOMContentLoaded', function () {
       }
 
     } else {
-      /* guest: show waiting prompt; actual video load happens in media_ready handler */
       var guestPrompt = el('upload-guest-prompt');
       if (guestPrompt) guestPrompt.style.display = 'flex';
 
-      /* if media already exists when guest joins (late joiner) */
-      if (roomData.media && roomData.media.url) {
+      /* late joiner — media already uploaded before they joined */
+      if (roomData.media && roomData.media.url && video) {
         if (guestPrompt) guestPrompt.style.display = 'none';
-        if (video) {
-          video.src = roomData.media.url;
-          video.style.display = 'block';
-          if (typeof Player !== 'undefined' && Player.init) {
-            Player.init({
-              videoEl:  video,
-              socket:   socket,
-              roomId:   state.roomId,
-              isHost:   state.isHost,
-              playback: roomData.playback,
-              settings: state.settings,
-            });
-          }
-          wirePlaybackBar(socket);
-          socket.emit('request_sync', { roomId: state.roomId });
+        video.src           = roomData.media.url;
+        video.style.display = 'block';
+        if (typeof Player !== 'undefined' && Player.init) {
+          Player.init({
+            videoEl:  video,
+            socket:   socket,
+            roomId:   state.roomId,
+            isHost:   state.isHost,
+            playback: roomData.playback,
+            settings: state.settings,
+          });
         }
+        wirePlaybackBar(socket);
+        socket.emit('request_sync', { roomId: state.roomId });
       }
     }
   }
 
-  /* ── Screenshare mode ────────────────────────────────────────────────────── */
   function initScreenshareMode(socket, roomData) {
     /*
-      ScreenShare.init() handles everything:
-        - checks navigator.mediaDevices / secure context
-        - shows error UI if unsupported
-        - wires the Start button for host
-        - registers ss_offer / ss_answer / ss_ice / ss_stopped listeners
+      screenshare.js self-registers all ss_offer / ss_answer / ss_ice /
+      ss_stopped socket listeners. Do NOT add them here too.
     */
     if (typeof ScreenShare !== 'undefined' && ScreenShare.init) {
       ScreenShare.init(socket, state.roomId, state.isHost);
     } else {
-      console.error('[app] screenshare.js not loaded');
+      console.error('[app] screenshare.js not loaded or ScreenShare.init missing');
     }
 
-    /* screenshare has no Player-based playback bar; hide it */
+    /* screenshare has no seek bar */
     var bar = el('playback-bar');
     if (bar) bar.style.display = 'none';
   }
@@ -576,45 +557,36 @@ document.addEventListener('DOMContentLoaded', function () {
      ══════════════════════════════════════════════════════════════════════════ */
 
   function wirePlaybackBar(socket) {
-    var playPauseBtn = el('play-pause-btn');
+    var playPauseBtn  = el('play-pause-btn');
     var progressTrack = el('progress-track');
-    var speedSelect  = el('speed-select');
-    var fullscreenBtn = el('fullscreen-btn');
+    var speedSelect   = el('speed-select');
     var qualitySelect = el('quality-select');
+    var fullscreenBtn = el('fullscreen-btn');
 
     if (playPauseBtn) {
       playPauseBtn.addEventListener('click', function () {
-        if (typeof Player !== 'undefined' && Player.togglePlayPause) {
-          Player.togglePlayPause();
-        }
+        if (typeof Player !== 'undefined' && Player.togglePlayPause) Player.togglePlayPause();
       });
     }
 
     if (progressTrack) {
       progressTrack.addEventListener('click', function (e) {
         var rect = progressTrack.getBoundingClientRect();
-        var pct  = (e.clientX - rect.left) / rect.width;
-        if (typeof Player !== 'undefined' && Player.seekTo) {
-          Player.seekTo(pct);
-        }
+        var pct  = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        if (typeof Player !== 'undefined' && Player.seekTo) Player.seekTo(pct);
       });
     }
 
     if (speedSelect) {
       speedSelect.addEventListener('change', function () {
         var rate = parseFloat(speedSelect.value);
-        if (typeof Player !== 'undefined' && Player.setRate) {
-          Player.setRate(rate, socket, state.roomId);
-        }
+        if (typeof Player !== 'undefined' && Player.setRate) Player.setRate(rate, socket, state.roomId);
       });
     }
 
     if (qualitySelect) {
       qualitySelect.addEventListener('change', function () {
-        socket.emit('quality_change', {
-          roomId:  state.roomId,
-          quality: qualitySelect.value,
-        });
+        socket.emit('quality_change', { roomId: state.roomId, quality: qualitySelect.value });
       });
     }
 
@@ -651,11 +623,7 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     if (sendBtn) sendBtn.addEventListener('click', sendChat);
-    if (input) {
-      input.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') sendChat();
-      });
-    }
+    if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') sendChat(); });
   }
 
   function appendChatMessage(nickname, text, ts) {
@@ -666,7 +634,7 @@ document.addEventListener('DOMContentLoaded', function () {
     var time = ts ? new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
     div.innerHTML =
       '<span class="chat-nick">' + escHtml(nickname) + '</span>' +
-      '<span class="chat-text">' + escHtml(text) + '</span>' +
+      '<span class="chat-text">' + escHtml(text)     + '</span>' +
       (time ? '<span class="chat-time"> ' + time + '</span>' : '');
     box.appendChild(div);
     box.scrollTop = box.scrollHeight;
@@ -689,9 +657,7 @@ document.addEventListener('DOMContentLoaded', function () {
   function addUserToList(socketId, nickname, isHost) {
     var list = el('user-list');
     if (!list) return;
-    /* avoid duplicates */
     if (list.querySelector('[data-sid="' + socketId + '"]')) return;
-
     var li = document.createElement('li');
     li.dataset.sid = socketId;
     if (isHost) li.classList.add('is-host');
@@ -712,17 +678,18 @@ document.addEventListener('DOMContentLoaded', function () {
   function updateHostBadge(newHostSocketId) {
     var list = el('user-list');
     if (!list) return;
-    /* clear all existing host badges */
     list.querySelectorAll('li').forEach(function (li) {
       li.classList.remove('is-host');
-      var badge = li.querySelector('.host-badge');
-      if (badge) badge.remove();
+      var b = li.querySelector('.host-badge');
+      if (b) b.remove();
     });
-    /* mark new host */
     var newLi = list.querySelector('[data-sid="' + newHostSocketId + '"]');
     if (newLi) {
       newLi.classList.add('is-host');
-      newLi.innerHTML += '<span class="host-badge">host</span>';
+      var badge = document.createElement('span');
+      badge.className   = 'host-badge';
+      badge.textContent = 'host';
+      newLi.appendChild(badge);
     }
   }
 
@@ -736,20 +703,21 @@ document.addEventListener('DOMContentLoaded', function () {
 
     if (settingsBtn && hostPanel) {
       settingsBtn.addEventListener('click', function () {
-        var visible = hostPanel.style.display !== 'none';
-        hostPanel.style.display = visible ? 'none' : 'block';
+        hostPanel.style.display = hostPanel.style.display === 'none' ? 'block' : 'none';
       });
     }
 
     function emitSettings() {
       if (!state.isHost) return;
-      var updated = {
-        hostOnlyControl: el('setting-host-only') ? el('setting-host-only').checked : state.settings.hostOnlyControl,
-        chatEnabled:     el('setting-chat')      ? el('setting-chat').checked      : state.settings.chatEnabled,
-        voiceEnabled:    el('setting-voice')     ? el('setting-voice').checked     : state.settings.voiceEnabled,
-        dataSaver:       el('setting-datasaver') ? el('setting-datasaver').checked : state.settings.dataSaver,
-      };
-      socket.emit('settings_update', { roomId: state.roomId, settings: updated });
+      socket.emit('settings_update', {
+        roomId: state.roomId,
+        settings: {
+          hostOnlyControl: el('setting-host-only') ? el('setting-host-only').checked : state.settings.hostOnlyControl,
+          chatEnabled:     el('setting-chat')      ? el('setting-chat').checked      : state.settings.chatEnabled,
+          voiceEnabled:    el('setting-voice')     ? el('setting-voice').checked     : state.settings.voiceEnabled,
+          dataSaver:       el('setting-datasaver') ? el('setting-datasaver').checked : state.settings.dataSaver,
+        },
+      });
     }
 
     ['setting-host-only', 'setting-chat', 'setting-voice', 'setting-datasaver'].forEach(function (id) {
@@ -759,34 +727,62 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   function applySettings(settings) {
-    /* sync checkbox states */
     if (el('setting-host-only')) el('setting-host-only').checked = !!settings.hostOnlyControl;
     if (el('setting-chat'))      el('setting-chat').checked      = !!settings.chatEnabled;
     if (el('setting-voice'))     el('setting-voice').checked     = !!settings.voiceEnabled;
     if (el('setting-datasaver')) el('setting-datasaver').checked = !!settings.dataSaver;
 
-    /* show/hide chat input based on setting */
     var chatSection = el('chat-section');
-    if (chatSection) chatSection.style.display = settings.chatEnabled ? 'flex' : 'none';
+    if (chatSection) chatSection.style.display = settings.chatEnabled !== false ? 'flex' : 'none';
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
      DATA METER
+
+     BUG FIX #2 — DataCounter.start is not a function:
+     We assumed a specific API shape without seeing datacounter.js source.
+     Now we probe every reasonable method name so this works regardless of
+     which API the actual file exposes.
      ══════════════════════════════════════════════════════════════════════════ */
 
   function wireDataMeter() {
-    if (typeof DataCounter === 'undefined') return;
     var valueEl = el('data-value');
     if (!valueEl) return;
-    DataCounter.start(function (bytes) {
-      if (bytes < 1024) {
-        valueEl.textContent = bytes + ' B';
-      } else if (bytes < 1024 * 1024) {
-        valueEl.textContent = (bytes / 1024).toFixed(1) + ' KB';
-      } else {
-        valueEl.textContent = (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-      }
-    });
+
+    function updateDisplay(bytes) {
+      bytes = Number(bytes) || 0;
+      if (bytes < 1024)            valueEl.textContent = bytes + ' B';
+      else if (bytes < 1048576)    valueEl.textContent = (bytes / 1024).toFixed(1) + ' KB';
+      else                         valueEl.textContent = (bytes / 1048576).toFixed(2) + ' MB';
+    }
+
+    if (typeof DataCounter === 'undefined') {
+      valueEl.textContent = '0 KB';
+      return;
+    }
+
+    /* callback-style APIs */
+    if (typeof DataCounter.start    === 'function') { DataCounter.start(updateDisplay);    return; }
+    if (typeof DataCounter.init     === 'function') { DataCounter.init(updateDisplay);     return; }
+    if (typeof DataCounter.onUpdate === 'function') { DataCounter.onUpdate(updateDisplay); return; }
+    if (typeof DataCounter.listen   === 'function') { DataCounter.listen(updateDisplay);   return; }
+    if (typeof DataCounter.onChange === 'function') { DataCounter.onChange(updateDisplay); return; }
+
+    /* getter-style APIs — poll every second */
+    var getter =
+      typeof DataCounter.getTotal === 'function' ? 'getTotal' :
+      typeof DataCounter.total    === 'function' ? 'total'    :
+      typeof DataCounter.bytes    === 'function' ? 'bytes'    :
+      typeof DataCounter.get      === 'function' ? 'get'      : null;
+
+    if (getter) {
+      setInterval(function () { updateDisplay(DataCounter[getter]()); }, 1000);
+      return;
+    }
+
+    /* unknown shape — log the actual API so it can be fixed */
+    console.warn('[app] DataCounter API shape unknown. Keys:', Object.keys(DataCounter));
+    valueEl.textContent = '0 KB';
   }
 
   /* ══════════════════════════════════════════════════════════════════════════
@@ -801,44 +797,29 @@ document.addEventListener('DOMContentLoaded', function () {
       copyBtn.addEventListener('click', function () {
         var link = window.location.origin + '/?code=' + state.roomCode;
         if (typeof copyText === 'function') copyText(link);
-        else navigator.clipboard && navigator.clipboard.writeText(link);
+        else if (navigator.clipboard) navigator.clipboard.writeText(link);
         toast('Invite link copied.');
       });
     }
 
-    if (leaveBtn) {
-      leaveBtn.addEventListener('click', function () {
-        leaveRoom(socket);
-      });
-    }
+    if (leaveBtn) leaveBtn.addEventListener('click', function () { leaveRoom(socket); });
   }
 
   function leaveRoom(socket) {
-    /* clean up screenshare if active */
-    if (typeof ScreenShare !== 'undefined' && ScreenShare.stop) {
-      ScreenShare.stop();
-    }
-    /* stop data counter */
-    if (typeof DataCounter !== 'undefined' && DataCounter.stop) {
-      DataCounter.stop();
-    }
-    /* disconnect socket */
+    if (typeof ScreenShare !== 'undefined' && ScreenShare.stop) ScreenShare.stop();
     if (socket) socket.disconnect();
-    state.socket   = null;
-    state.roomId   = null;
-    state.roomCode = null;
-    state.isHost   = false;
+
+    state.socket    = null;
+    state.roomId    = null;
+    state.roomCode  = null;
+    state.isHost    = false;
     state.hostToken = null;
 
-    /* clear invite code from URL */
     history.replaceState({}, '', '/');
-
     goHome();
   }
 
-  function goHome() {
-    initHomePage();
-  }
+  function goHome() { initHomePage(); }
 
   /* ══════════════════════════════════════════════════════════════════════════
      MOBILE SIDEBAR TOGGLE
@@ -878,16 +859,10 @@ document.addEventListener('DOMContentLoaded', function () {
      BOOT
      ══════════════════════════════════════════════════════════════════════════ */
 
-  /*
-    If the URL already has a room code (e.g. user followed an invite link),
-    pre-populate the join form and scroll to it.
-  */
   initHomePage();
 
-  var params = new URLSearchParams(window.location.search);
-  var inviteCode = params.get('code') || params.get('room');
-  if (inviteCode) {
-    /* scroll join card into view after home page renders */
+  var bootParams = new URLSearchParams(window.location.search);
+  if (bootParams.get('code') || bootParams.get('room')) {
     setTimeout(function () {
       var joinCard = el('join-card');
       if (joinCard) joinCard.scrollIntoView({ behavior: 'smooth' });
