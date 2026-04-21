@@ -1,135 +1,196 @@
-// screenshare.js - WebRTC screen share, host-to-guests
+/* screenshare.js — WebRTC screen share (host broadcasts, guests receive) */
 
-const ScreenShare = (() => {
-  const ICE = [{ urls: 'stun:stun.l.google.com:19302' }];
-  let localStream = null;
-  let peerConnections = new Map(); // socketId -> RTCPeerConnection (host side)
-  let receiverPc = null;           // guest side single connection
+let hostStream = null;
+let hostPC = null;       // single peer connection (one-guest limitation noted)
+let guestPC = null;
+let _socket = null;
+let _roomId = null;
 
-  // ---- HOST ----
-  async function startShare(socket, roomId) {
-    try {
-      localStream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          frameRate: { ideal: 15, max: 20 },
-          width: { ideal: 1280 },
-        },
-        audio: false,
-      });
+// ── Secure context guard ────────────────────────────────────────────────────
+function isScreenShareAvailable() {
+  if (!window.isSecureContext) return false;
+  if (!navigator.mediaDevices) return false;
+  if (typeof navigator.mediaDevices.getDisplayMedia !== 'function') return false;
+  return true;
+}
 
-      const localVid = document.getElementById('ss-video');
-      if (localVid) {
-        localVid.srcObject = localStream;
-        localVid.muted = true;
-        localVid.style.display = '';
-        document.getElementById('ss-host-prompt').style.display = 'none';
-      }
+function showSSUnavailable() {
+  const msg =
+    window.location.protocol === 'http:' && window.location.hostname !== 'localhost'
+      ? 'Screen share requires HTTPS. Either use localhost or serve the app over HTTPS.'
+      : 'Your browser does not support screen sharing (getDisplayMedia unavailable).';
 
-      // When a guest sends an ICE candidate back
-      socket.on('ss_ice', ({ candidate }) => {
-        peerConnections.forEach(pc => {
-          pc.addIceCandidate(candidate).catch(() => {});
-        });
-      });
+  // Replace host prompt with a clear error panel
+  const prompt = document.getElementById('ss-host-prompt');
+  if (prompt) {
+    prompt.innerHTML = `
+      <p style="color:var(--danger);font-weight:600;">Screen share unavailable</p>
+      <p class="note" style="max-width:320px;text-align:center;">${msg}</p>
+    `;
+  }
+}
 
-      // When a new guest joins, server sends them our offer via user_joined
-      // But we need to create an offer per guest. We send one broadcast offer
-      // and all guests respond with answers tracked by their socket id.
-      await createOfferForRoom(socket, roomId);
+// ── Host side ───────────────────────────────────────────────────────────────
+async function startScreenShare(socket, roomId) {
+  _socket = socket;
+  _roomId = roomId;
 
-      localStream.getVideoTracks()[0].addEventListener('ended', () => {
-        stopShare(socket, roomId);
-      });
+  if (!isScreenShareAvailable()) {
+    showSSUnavailable();
+    return;
+  }
 
-    } catch (err) {
-      Utils.toast('Screen share failed: ' + err.message);
+  try {
+    hostStream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: { ideal: 15, max: 30 }, cursor: 'always' },
+      audio: false,
+    });
+  } catch (err) {
+    if (err.name === 'NotAllowedError') {
+      showToast('Screen share permission denied.');
+    } else {
+      showToast('Screen share failed: ' + err.message);
     }
+    return;
   }
 
-  async function createOfferForRoom(socket, roomId) {
-    const pc = new RTCPeerConnection({ iceServers: ICE });
-    peerConnections.set('broadcast', pc);
-
-    localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-    pc.addEventListener('icecandidate', e => {
-      if (e.candidate) socket.emit('ss_ice', { roomId, candidate: e.candidate });
-    });
-
-    pc.addEventListener('connectionstatechange', () => {
-      if (pc.connectionState === 'connected') capBitrate(pc, 1200);
-    });
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    socket.emit('ss_offer', { roomId, offer });
+  // Show local preview
+  const video = document.getElementById('ss-video');
+  if (video) {
+    video.srcObject = hostStream;
+    video.style.display = 'block';
+    video.muted = true;
+    video.play().catch(() => {});
   }
+  document.getElementById('ss-host-prompt').style.display = 'none';
 
-  function handleAnswer(answer) {
-    const pc = peerConnections.get('broadcast');
-    if (pc && pc.signalingState === 'have-local-offer') {
-      pc.setRemoteDescription(answer).catch(() => {});
+  // Create peer connection and send offer
+  hostPC = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+  hostStream.getTracks().forEach(track => hostPC.addTrack(track, hostStream));
+
+  hostPC.onicecandidate = ({ candidate }) => {
+    if (candidate) {
+      socket.emit('ss_ice', { roomId, candidate: candidate.toJSON() });
     }
-  }
+  };
 
-  function handleIce(candidate) {
-    peerConnections.forEach(pc => {
-      pc.addIceCandidate(candidate).catch(() => {});
-    });
-  }
-
-  function stopShare(socket, roomId) {
-    if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
-    peerConnections.forEach(pc => pc.close());
-    peerConnections.clear();
-    socket.emit('ss_stopped', { roomId });
-    const v = document.getElementById('ss-video');
-    if (v) { v.srcObject = null; v.style.display = 'none'; }
-    document.getElementById('ss-host-prompt').style.display = '';
-    Utils.toast('Screen share stopped');
-  }
-
-  // ---- GUEST ----
-  function initReceiver(socket, roomId) {
-    receiverPc = new RTCPeerConnection({ iceServers: ICE });
-
-    receiverPc.addEventListener('track', e => {
-      const vid = document.getElementById('ss-video');
-      if (vid) {
-        vid.srcObject = e.streams[0];
-        vid.style.display = '';
-        document.getElementById('ss-guest-prompt').style.display = 'none';
-      }
-    });
-
-    socket.on('ss_offer', async ({ offer }) => {
-      if (!receiverPc) return;
-      await receiverPc.setRemoteDescription(offer);
-      const answer = await receiverPc.createAnswer();
-      await receiverPc.setLocalDescription(answer);
-      socket.emit('ss_answer', { roomId, answer });
-    });
-
-    socket.on('ss_ice', ({ candidate }) => {
-      receiverPc?.addIceCandidate(candidate).catch(() => {});
-    });
-
-    receiverPc.addEventListener('icecandidate', e => {
-      if (e.candidate) socket.emit('ss_ice', { roomId, candidate: e.candidate });
-    });
-  }
-
-  // Cap video encoding bitrate
-  async function capBitrate(pc, kbps) {
-    for (const sender of pc.getSenders()) {
-      if (sender.track?.kind !== 'video') continue;
-      const params = sender.getParameters();
-      if (!params.encodings?.length) params.encodings = [{}];
-      params.encodings[0].maxBitrate = kbps * 1000;
-      params.encodings[0].maxFramerate = 15;
-      await sender.setParameters(params).catch(() => {});
+  hostPC.onconnectionstatechange = () => {
+    if (['failed', 'disconnected'].includes(hostPC.connectionState)) {
+      showToast('Screen share connection lost.');
     }
+  };
+
+  try {
+    const offer = await hostPC.createOffer();
+    await hostPC.setLocalDescription(offer);
+    socket.emit('ss_offer', { roomId, offer: hostPC.localDescription });
+  } catch (err) {
+    showToast('Failed to create screen share offer: ' + err.message);
+    stopScreenShare(socket, roomId);
+    return;
   }
 
-  return { startShare, handleAnswer, handleIce, stopShare, initReceiver };
-})();
+  // Stop sharing when user clicks "Stop sharing" in browser UI
+  hostStream.getVideoTracks()[0].onended = () => stopScreenShare(socket, roomId);
+}
+
+async function handleAnswer(answer) {
+  if (!hostPC) return;
+  try {
+    await hostPC.setRemoteDescription(new RTCSessionDescription(answer));
+  } catch (err) {
+    showToast('Screen share answer error: ' + err.message);
+  }
+}
+
+async function handleHostIce(candidate) {
+  if (!hostPC) return;
+  try {
+    await hostPC.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (_) {}
+}
+
+function stopScreenShare(socket, roomId) {
+  if (hostStream) {
+    hostStream.getTracks().forEach(t => t.stop());
+    hostStream = null;
+  }
+  if (hostPC) {
+    hostPC.close();
+    hostPC = null;
+  }
+  const video = document.getElementById('ss-video');
+  if (video) { video.srcObject = null; video.style.display = 'none'; }
+  document.getElementById('ss-host-prompt').style.display = 'flex';
+  socket.emit('ss_stopped', { roomId });
+}
+
+// ── Guest side ──────────────────────────────────────────────────────────────
+async function receiveScreenShare(socket, roomId, offer) {
+  _socket = socket;
+  _roomId = roomId;
+
+  if (guestPC) { guestPC.close(); guestPC = null; }
+
+  guestPC = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+  guestPC.ontrack = ({ streams }) => {
+    const video = document.getElementById('ss-video');
+    if (video && streams[0]) {
+      video.srcObject = streams[0];
+      video.style.display = 'block';
+      video.play().catch(() => {});
+    }
+    document.getElementById('ss-guest-prompt').style.display = 'none';
+  };
+
+  guestPC.onicecandidate = ({ candidate }) => {
+    if (candidate) {
+      socket.emit('ss_ice', { roomId, candidate: candidate.toJSON() });
+    }
+  };
+
+  guestPC.onconnectionstatechange = () => {
+    if (['failed', 'disconnected'].includes(guestPC.connectionState)) {
+      showToast('Screen share stream lost.');
+      resetGuestView();
+    }
+  };
+
+  try {
+    await guestPC.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await guestPC.createAnswer();
+    await guestPC.setLocalDescription(answer);
+    socket.emit('ss_answer', { roomId, answer: guestPC.localDescription });
+  } catch (err) {
+    showToast('Failed to connect to screen share: ' + err.message);
+  }
+}
+
+async function handleGuestIce(candidate) {
+  if (!guestPC) return;
+  try {
+    await guestPC.addIceCandidate(new RTCIceCandidate(candidate));
+  } catch (_) {}
+}
+
+function resetGuestView() {
+  const video = document.getElementById('ss-video');
+  if (video) { video.srcObject = null; video.style.display = 'none'; }
+  const prompt = document.getElementById('ss-guest-prompt');
+  if (prompt) prompt.style.display = 'flex';
+  if (guestPC) { guestPC.close(); guestPC = null; }
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+window.ScreenShare = {
+  start: startScreenShare,
+  stop: stopScreenShare,
+  handleAnswer,
+  handleHostIce,
+  receiveScreenShare,
+  handleGuestIce,
+  resetGuestView,
+  isAvailable: isScreenShareAvailable,
+};
